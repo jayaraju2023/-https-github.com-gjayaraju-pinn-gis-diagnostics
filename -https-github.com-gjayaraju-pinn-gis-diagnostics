@@ -1,0 +1,223 @@
+1. Anonymized Thermographic Measurement Datasets
+1.1 Data Structure
+The dataset comprises four validation cases (Vemagiri, Maheswaram, Northern India, Western India). For each case, the following files are provided:
+
+case_<id>_measurements.csv – outer‑surface temperature measurements at discrete axial positions and times.
+
+case_<id>_metadata.json – substation information, ambient conditions, fault type, and SF₆ analysis results.
+
+case_<id>_geometry.json – enclosure geometry (inner/outer radii, axial length, wall thickness).
+
+All personally identifiable information (site names, exact coordinates) are removed; only generic identifiers and anonymised values are retained.
+
+1.2 Sample Synthetic Data (CSV Format)
+Below is a synthetic example for Case 1 (Vemagiri), representative of the actual data.
+
+case_1_measurements.csv
+
+text
+z_m, t_5min, t_10min, t_15min, t_30min
+0.0, 34.2, 33.8, 33.6, 33.4
+0.5, 35.1, 34.5, 34.1, 33.7
+1.0, 36.9, 35.8, 35.0, 34.2
+1.5, 36.2, 35.2, 34.5, 33.9
+2.0, 35.0, 34.3, 34.0, 33.6
+2.5, 34.5, 34.0, 33.8, 33.5
+3.0, 34.0, 33.7, 33.5, 33.3
+z_m – axial position along the bay (m) from the centre of the arc.
+
+t_5min, t_10min, t_15min, t_30min – measured outer‑surface temperature (°C) at those elapsed times.
+
+case_1_metadata.json
+
+json
+{
+  "case_id": 1,
+  "substation": "Vemagiri",
+  "fault_type": "circuit breaker flashover",
+  "ambient_temp": 33.4,
+  "relative_humidity": 65,
+  "SF6_analysis": {
+    "SO2_ppm": 42,
+    "SOF2_ppm": 18,
+    "SO2F2_ppm": 7,
+    "HF_ppm": 2
+  },
+  "severity_class": "Class II",
+  "trip_time": "2025-03-15T14:23:00Z",
+  "inspection_window_min": 14
+}
+case_1_geometry.json
+
+json
+{
+  "inner_radius_m": 0.25,
+  "outer_radius_m": 0.265,
+  "axial_length_m": 4.0,
+  "material": "EN AW-6061-T6",
+  "emissivity": 0.12,
+  "wall_thickness_m": 0.015
+}
+Similar files are provided for cases 2, 3, and 4.
+
+2. PINN Training Scripts (Python/PyTorch)
+The repository contains a main training script train_pinn.py that implements the forward and inverse PINN described in Section 5 of the paper. Below we show the core structure and key functions.
+
+2.1 Network Definition
+python
+import torch
+import torch.nn as nn
+
+class PINN(nn.Module):
+    def __init__(self, layers=[3, 256, 256, 256, 256, 256, 256, 1]):
+        super(PINN, self).__init__()
+        self.activation = nn.Tanh()
+        self.layers = nn.ModuleList()
+        for i in range(len(layers)-1):
+            self.layers.append(nn.Linear(layers[i], layers[i+1]))
+        # Physical parameters as trainable scalars
+        self.E_a = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))   # MJ
+        self.eta = nn.Parameter(torch.tensor(0.35, dtype=torch.float32))
+        self.r_arc = nn.Parameter(torch.tensor(0.04, dtype=torch.float32)) # m
+
+    def forward(self, r, z, t):
+        # concatenate inputs
+        x = torch.cat([r, z, t], dim=1)
+        for i, layer in enumerate(self.layers[:-1]):
+            x = self.activation(layer(x))
+        x = self.layers[-1](x)
+        return x
+2.2 Loss Functions (PDE residual, data fidelity, boundary conditions)
+python
+def pde_loss(model, r, z, t, rho, cp, k, r_arc, eta, E_a, tau_arc, r0, z0):
+    # Automatic differentiation
+    T = model(r, z, t)
+    T_t = torch.autograd.grad(T, t, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+    T_r = torch.autograd.grad(T, r, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+    T_rr = torch.autograd.grad(T_r, r, grad_outputs=torch.ones_like(T_r), create_graph=True)[0]
+    T_zz = torch.autograd.grad(T, z, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+    
+    # Source term
+    Q = (eta * E_a) / (torch.pi * r_arc**2 * L * tau_arc) * \
+        torch.exp(-((r - r0)**2 + (z - z0)**2) / (2 * r_arc**2))
+    
+    # PDE residual
+    residual = rho * cp * T_t - k * (T_rr + (1/r)*T_r + T_zz) - Q
+    return torch.mean(residual**2)
+
+def data_loss(model, r_obs, z_obs, t_obs, T_meas):
+    T_pred = model(r_obs, z_obs, t_obs)
+    return torch.mean((T_pred - T_meas)**2)
+
+def bc_loss(model, r_bc, z_bc, t_bc, h_conv, eps, sigma, T_amb, k):
+    T = model(r_bc, z_bc, t_bc)
+    T_r = torch.autograd.grad(T, r_bc, grad_outputs=torch.ones_like(T), create_graph=True)[0]
+    # Outer boundary: -k * dT/dr = h_conv*(T - T_amb) + eps*sigma*(T^4 - T_amb^4)
+    residual_bc = -k * T_r - (h_conv*(T - T_amb) + eps*sigma*(T**4 - T_amb**4))
+    return torch.mean(residual_bc**2)
+2.3 Training Loop with Multi‑Rate Adam + L‑BFGS
+python
+def train_pinn(model, optimizer_adam, optimizer_lbfgs, train_data, n_epochs=15000):
+    for epoch in range(n_epochs):
+        # Sample collocation points, boundary points, data points
+        # ... (data loading omitted)
+        loss = lambda1 * pde_loss(...) + lambda2 * data_loss(...) + lambda3 * bc_loss(...)
+        optimizer_adam.zero_grad()
+        loss.backward()
+        optimizer_adam.step()
+        if epoch % 1000 == 0:
+            print(f"Epoch {epoch}, loss: {loss.item()}")
+    # L-BFGS refinement
+    def closure():
+        optimizer_lbfgs.zero_grad()
+        loss = lambda1 * pde_loss(...) + lambda2 * data_loss(...) + lambda3 * bc_loss(...)
+        loss.backward()
+        return loss
+    optimizer_lbfgs.step(closure)
+Complete training scripts, data loaders, and configuration files are provided in the repository.
+
+3. Monte Carlo Uncertainty Propagation Code
+The Monte Carlo code (mc_uncertainty.py) propagates the five uncertainty sources (Eₐ, wall thickness, emissivity, ambient temperature, inspection time) through the lumped ODE solution (Equation 5) to compute detection probability.
+
+python
+import numpy as np
+from scipy.stats import norm, uniform
+
+def sample_uncertainties(n_samples):
+    # E_a: coefficient of variation 15% around nominal 1.5 MJ
+    E_a = norm.rvs(loc=1.5, scale=0.15*1.5, size=n_samples)
+    # wall thickness: uniform ±1 mm around 15 mm
+    thick = uniform.rvs(loc=14e-3, scale=2e-3, size=n_samples)
+    # emissivity: uniform ±0.02 around 0.12
+    eps = uniform.rvs(loc=0.10, scale=0.04, size=n_samples)
+    # ambient temperature: normal ±3°C around 25°C
+    T_amb = norm.rvs(loc=25, scale=3, size=n_samples)
+    # inspection time: uniform ±2 min around 10 min
+    t_insp = uniform.rvs(loc=8*60, scale=4*60, size=n_samples)  # seconds
+    return E_a, thick, eps, T_amb, t_insp
+
+def compute_detection_prob(E_a, thick, eps, T_amb, t_insp, threshold=3.5):
+    # Compute ΔT using analytical solution (Equation 5)
+    # ... (implementation with material properties)
+    delta_T = ...  # vector of ΔT values
+    return np.mean(delta_T > threshold)
+The script runs 50,000 realisations and outputs the detection probability curve as shown in Fig. 6.
+
+4. ROC Analysis Routines
+The ROC analysis (roc_analysis.py) sweeps the detection threshold from 1.0°C to 8.0°C in 0.25°C steps and computes sensitivity and specificity from the 47‑event archive.
+
+python
+import numpy as np
+from sklearn.metrics import roc_curve, auc
+
+def compute_roc(scores, ground_truth):
+    fpr, tpr, thresholds = roc_curve(ground_truth, scores)
+    roc_auc = auc(fpr, tpr)
+    # Youden index: maximize tpr - fpr
+    youden_idx = np.argmax(tpr - fpr)
+    optimal_threshold = thresholds[youden_idx]
+    return fpr, tpr, roc_auc, optimal_threshold
+The script loads all 47 event records, computes the PINN‑reconstructed ΔT for each, and generates the ROC curve (Fig. 7) and the performance metrics reported in Table 12.
+
+5. Repository Structure
+The public repository (to be made available upon acceptance) will have the following layout:
+
+text
+pinn-gis-diagnostics/
+├── README.md
+├── data/
+│   ├── case_1/
+│   │   ├── measurements.csv
+│   │   ├── metadata.json
+│   │   └── geometry.json
+│   ├── case_2/
+│   ├── case_3/
+│   ├── case_4/
+│   └── archive_47_events/   (anonymized)
+├── src/
+│   ├── pinn_model.py
+│   ├── train_pinn.py
+│   ├── mc_uncertainty.py
+│   ├── roc_analysis.py
+│   └── utils.py
+├── config/
+│   ├── hyperparams.yaml
+│   └── material_props.yaml
+├── notebooks/
+│   ├── explore_data.ipynb
+│   └── plot_results.ipynb
+└── requirements.txt
+All code is written in Python 3.9+ and requires PyTorch 2.0+, NumPy, SciPy, pandas, scikit‑learn, and matplotlib.
+
+6. Usage Instructions
+Clone the repository.
+
+Install dependencies: pip install -r requirements.txt
+
+To train the PINN for a given case: python src/train_pinn.py --case_id 1
+
+To run Monte Carlo uncertainty: python src/mc_uncertainty.py --n_samples 50000
+
+To reproduce ROC analysis: python src/roc_analysis.py --archive_path data/archive_47_events/
+
+The trained model weights and all results are saved in the outputs/ directory.
